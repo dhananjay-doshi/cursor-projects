@@ -1,76 +1,86 @@
-"""Generate sample traffic KPI data for development and demos."""
+"""Generate a sample KPI table for development and demos."""
 
 from __future__ import annotations
 
 import math
 import random
+import sqlite3
 from datetime import datetime, timedelta
+from pathlib import Path
 
-from .database import KpiRecord, METRIC_UNITS, init_db, insert_kpis
+from .database import TIMESTAMP_FORMAT, quote_ident
 
-DEFAULT_SOURCES = ("eth0", "eth1", "wan0")
-DEFAULT_METRICS = tuple(METRIC_UNITS.keys())
+DEMO_TABLE = "traffic_metrics"
+DEMO_TIME_COLUMN = "recorded_at"
+DEMO_KPI_COLUMNS = (
+    "throughput_in_mbps",
+    "throughput_out_mbps",
+    "latency_ms",
+    "packet_loss_pct",
+)
 
 
-def _metric_value(metric_name: str, hour: float, source_index: int) -> float:
-    """Produce realistic-looking synthetic KPI values."""
+def _metric_value(column: str, hour: float) -> float:
     phase = hour / 24.0 * 2 * math.pi
     noise = random.uniform(-0.08, 0.08)
-    base = 1.0 + 0.25 * math.sin(phase + source_index)
 
-    if metric_name.startswith("throughput"):
-        peak = 850 if "in" in metric_name else 620
-        return max(0.0, peak * base * (1 + noise))
-
-    if metric_name.startswith("packet_rate"):
-        peak = 120_000 if "in" in metric_name else 95_000
-        return max(0.0, peak * base * (1 + noise))
-
-    if metric_name == "latency_ms":
+    if column == "throughput_in_mbps":
+        return max(0.0, 850 * (1 + 0.25 * math.sin(phase)) * (1 + noise))
+    if column == "throughput_out_mbps":
+        return max(0.0, 620 * (1 + 0.25 * math.sin(phase + 0.5)) * (1 + noise))
+    if column == "latency_ms":
         return max(1.0, 12 + 8 * math.sin(phase * 2) + random.uniform(-2, 2))
-
-    if metric_name == "packet_loss_pct":
+    if column == "packet_loss_pct":
         return max(0.0, 0.05 + 0.4 * abs(math.sin(phase * 3)) + random.uniform(0, 0.1))
-
-    if metric_name == "active_connections":
-        return max(0.0, 4_000 + 2_500 * base + random.uniform(-200, 200))
-
-    if metric_name == "error_rate":
-        return max(0.0, 3 + 5 * abs(math.sin(phase * 4)) + random.uniform(0, 2))
 
     return random.uniform(0, 100)
 
 
-def seed_traffic_kpis(
-    db_path: str,
+def seed_demo_table(
+    db_path: str | Path,
     *,
     hours: int = 24,
     interval_minutes: int = 5,
-    sources: tuple[str, ...] = DEFAULT_SOURCES,
-    metrics: tuple[str, ...] = DEFAULT_METRICS,
+    table: str = DEMO_TABLE,
+    time_column: str = DEMO_TIME_COLUMN,
+    kpi_columns: tuple[str, ...] = DEMO_KPI_COLUMNS,
 ) -> int:
-    init_db(db_path)
+    path = Path(db_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    quoted_table = quote_ident(table)
+    quoted_time = quote_ident(time_column)
+    quoted_kpis = ", ".join(quote_ident(column) for column in kpi_columns)
+    column_defs = ", ".join(f"{quote_ident(column)} REAL NOT NULL" for column in kpi_columns)
 
     end = datetime.now().replace(second=0, microsecond=0)
     start = end - timedelta(hours=hours)
     step = timedelta(minutes=interval_minutes)
 
-    records: list[KpiRecord] = []
+    rows: list[tuple] = []
     current = start
     while current <= end:
         hour = current.hour + current.minute / 60.0
-        for source_index, source in enumerate(sources):
-            for metric_name in metrics:
-                records.append(
-                    KpiRecord(
-                        recorded_at=current,
-                        source=source,
-                        metric_name=metric_name,
-                        metric_value=round(
-                            _metric_value(metric_name, hour, source_index), 4
-                        ),
-                    )
-                )
+        values = tuple(round(_metric_value(column, hour), 4) for column in kpi_columns)
+        rows.append((current.strftime(TIMESTAMP_FORMAT), *values))
         current += step
 
-    return insert_kpis(db_path, records)
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {quoted_table} (
+                {quoted_time} TEXT NOT NULL,
+                {column_defs}
+            )
+            """
+        )
+        conn.execute(f"DELETE FROM {quoted_table}")
+
+        placeholders = ", ".join("?" * (1 + len(kpi_columns)))
+        conn.executemany(
+            f"INSERT INTO {quoted_table} ({quoted_time}, {quoted_kpis}) VALUES ({placeholders})",
+            rows,
+        )
+        conn.commit()
+
+    return len(rows)
