@@ -248,7 +248,8 @@ Please confirm:
 2. Official latency SLO: **&lt; 20 ms** — **CONFIRMED**  
 3. Pool sizing: **17 / 17 / 17** approved by DBA against Postgres capacity?  
 4. Planned restart: will platform provide a **drain signal**, or rely solely on reactive quarantine + failover?  
-5. Accept **DRAINING / RECOVERING** states beyond simple UP/DOWN?
+5. Accept **DRAINING / RECOVERING** states beyond simple UP/DOWN?  
+6. **Last UP pool also down**: fail fast with `NPDB_ALL_POOLS_UNAVAILABLE` + CRITICAL alarm (do not keep dead last pool in RR) — see HLD §6.4?
 
 ---
 

@@ -7,7 +7,7 @@
 | Target runtime | Java (CNF / Kubernetes) |
 | Connection pool | HikariCP |
 | Database | PostgreSQL (1 Primary + 2 Replica), Multus static IPs |
-| Status | **Draft v0.3 — query response time SLO confirmed (&lt; 20 ms); awaiting remaining OD confirmations** |
+| Status | **Draft v0.4 — &lt;20 ms SLO confirmed; last-pool-down policy added** |
 | Audience | Architecture, Development, SRE / Ops |
 | Related | [`DESIGN_REVIEW.md`](./DESIGN_REVIEW.md) |
 
@@ -82,7 +82,7 @@ Design a production-ready, telco-grade Java connection-management module that le
 | FR-08b | Service OAM may use up to 2 alternate-pool attempts |
 | FR-09 | Metrics: queries/pool/connection, failed/available, transitions |
 | FR-10 | Postgres restart: equal LB on survivors; no NP message loss if ≥1 other pool healthy |
-| FR-11 | App starts if DB down (`initializationFailTimeout=0`); Hikari reconnects in background |
+| FR-12 | When **zero** pools are UP: fail fast (no borrow); CRITICAL alarm; SLP broadcast; monitor-driven recovery only |
 
 ### 2.2 Non-Functional
 
@@ -303,6 +303,68 @@ loop:
 - If ≥1 other pool is healthy, NP message succeeds during a single-pod restart.
 
 Business SQL errors (syntax, no row policy, etc.) fail once — no failover.
+
+### 6.4 Last Remaining UP Pool Restarts / Goes Down
+
+Worker selection rule (confirmed): **each worker picks the next pool that is already UP** (round-robin among UP only).
+
+When the system has already degraded to a **single UP pool**, and that last pool also restarts or fails:
+
+```
+UP count: 3 → 2 → 1 → 0
+                         ▲
+                         └── last pool infra failure / restart
+```
+
+#### Recommended behavior (normative)
+
+| Step | Action | Rationale |
+| --- | --- | --- |
+| 1 | Worker hits infra error on the last UP pool | Same detection as any other pool |
+| 2 | **Atomically quarantine** that pool (UP → DRAINING/DOWN in selector) | Do **not** keep a known-dead pool in RR “because it is the last one” — that violates &lt;20 ms via timeouts |
+| 3 | `nextUpPool()` returns **null** (zero UP pools) | No alternate target for failover |
+| 4 | **Do not** call `getConnection()` on DOWN/DRAINING pools | Prevents connectionTimeout storms and SLO breach |
+| 5 | Return **immediate** failure to SLP with distinct cause `NPDB_ALL_POOLS_UNAVAILABLE` | Fail-fast; caller/SLP applies existing error handling |
+| 6 | Enqueue event → Management raises **CRITICAL** alarm + broadcasts “all NP DB DOWN” | Upstream can stop/shed NP traffic; ops notified |
+| 7 | Monitoring continues probing **all three** pools every 5 s | Sole recovery path while workers stay fail-fast |
+| 8 | First pool to pass gated recovery → UP; RR resumes (100% on that one, then equalize as others return) | Automatic restoration |
+
+```
+Worker on last UP pool
+  → infra failure
+  → quarantine(lastPool)          // UP count becomes 0
+  → nextUpPool() == null
+  → return NPDB_ALL_POOLS_UNAVAILABLE to SLP   // no Hikari borrow
+  → Management: CRITICAL alarm + SLP broadcast
+  → Monitor: probe P/R1/R2 until RECOVERING→UP
+```
+
+#### What not to do
+
+| Anti-pattern | Why reject |
+| --- | --- |
+| Keep last pool UP after infra failure | Workers block on dead connections; blows &lt;20 ms SLO |
+| Blindly try DOWN pools from workers | Same timeout storm; defeats healthy-only RR |
+| Sleep/retry in worker waiting for recovery | Violates latency SLO; blocks worker capacity |
+| Claim “no message failure” when UP count = 0 | Impossible without a live Postgres endpoint |
+
+#### Guarantees (honest)
+
+| Situation | NP message outcome |
+| --- | --- |
+| ≥1 other pool still UP | Failover → **success** (no message failure) |
+| Last / only UP pool also down | **Fail fast** to SLP — unavoidable until monitor restores ≥1 pool |
+| All three down at process start | Workers fail fast; Hikari background reconnect + monitor bring pools UP later |
+
+#### SLP / application coordination
+
+When Management broadcasts **all pools DOWN**:
+
+1. SLP should treat NP DB as unavailable (alarm already raised).  
+2. Optional: SLP sheds or rejects new NP queries locally to protect the node (policy outside this module).  
+3. When any pool returns to UP, broadcast clears CRITICAL / sets degraded-or-clear; workers resume RR automatically.
+
+Service OAM may still attempt its max-2 alternate-pool policy, but with zero UP pools it must likewise fail fast after selector returns null (no point burning OAM threads on DOWN pools).
 
 ---
 
@@ -540,6 +602,7 @@ NpDbClient.shutdown()
 | 0.1 | 2026-07-13 | Initial HLD from original requirements |
 | 0.2 | 2026-07-13 | Aligned to stakeholder design; added restart equal-LB + no message failure controls; see DESIGN_REVIEW.md |
 | 0.3 | 2026-07-13 | Confirmed query response time SLO: **&lt; 20 ms** (OD-07 closed) |
+| 0.4 | 2026-07-13 | Last remaining UP pool down: fail-fast policy (§6.4 / §20.7) |
 
 ---
 
@@ -573,9 +636,10 @@ This section is normative for the review focus.
 | Before restart (3 UP) | 33/33/33 | Success |
 | Planned drain of pod X | 50/50 on others **before** PG stops | **No new failures** |
 | Abrupt crash of pod X | Within one request: failover to next UP; RR excludes X | **Success if ≥1 other UP** |
-| Steady degraded | 50/50 (or 100%) | Success on survivors |
-| Gated recovery | Still 50/50 until UP | No premature share |
-| Post UP | 33/33/33 | Success |
+| Steady degraded (1 UP) | 100% on survivor | Success on survivor |
+| **Last UP pool also down** | RR empty | **Fail fast** `NPDB_ALL_POOLS_UNAVAILABLE`; CRITICAL alarm (§6.4) |
+| Gated recovery | Still exclude until UP | No premature share |
+| Post UP | 33/33/33 (or 100% if only one recovered) | Success |
 
 ### 20.3 Controls (Mandatory for FR-10 / NFR-06)
 
@@ -615,3 +679,7 @@ Ops → drainPool(primary)
 - Guaranteeing success when **all** pools are down or draining.  
 - Retrying after a **business** SQL failure.  
 - Keeping a restarting pool in RR “to preserve 33% share” — availability beats naive share during failure.
+
+### 20.7 Last Pool Down (Detail)
+
+See **§6.4**. Summary: quarantine the last pool, return `NPDB_ALL_POOLS_UNAVAILABLE` immediately, CRITICAL alarm + SLP broadcast, recover only via monitoring — never force workers onto DOWN pools.
