@@ -7,7 +7,7 @@
 | Target runtime | Java (CNF / Kubernetes) |
 | Connection pool | HikariCP |
 | Database | PostgreSQL (1 Primary + 2 Replica), Multus static IPs |
-| Status | **Draft v0.8 — dual timeout model for NP vs bulk DML (§5.6)** |
+| Status | **Draft v0.9 — timeout profile apply/reset-before-query guidance (§5.6.3)** |
 | Audience | Architecture, Development, SRE / Ops |
 | Related | [`DESIGN_REVIEW.md`](./DESIGN_REVIEW.md) |
 
@@ -424,30 +424,169 @@ getConnection()                    // same Hikari connectionTimeout for everyone
 3. Do **not** run large transactions that hold a borrowed connection for minutes without chunking.  
 4. Prefer bulk against **PRIMARY-only** datasource even if NP RRs replicas.
 
-#### 5.6.3 How to apply per-borrow timeouts (both approaches)
+#### 5.6.3 How to update the timeout profile **before** the query
 
-```text
-enum TimeoutProfile { NP_LOOKUP, BULK_DML, OAM_READ }
+Timeouts that can change **per operation** are applied on the **borrowed `Connection` / `Statement`**, after `getConnection()` and **before** `execute*()`. Hikari pool settings are fixed at pool creation and are **not** updated per query.
 
-void apply(Connection c, TimeoutProfile p, Executor ex) {
-  switch (p) {
-    case NP_LOOKUP:
-      c.setNetworkTimeout(ex, npNetworkCeilingMs);      // e.g. 200
-      // statement: no setQueryTimeout(1s); use 20ms cancel watchdog
-      break;
-    case BULK_DML:
-      c.setNetworkTimeout(ex, bulkNetworkTimeoutMs);    // e.g. 60000
-      // statement.setQueryTimeout(bulkQueryTimeoutSec); // e.g. 30
-      break;
-  }
+##### Order of operations (normative)
+
+```
+1. select pool (NP or BULK family)
+2. Connection c = dataSource.getConnection()     // Hikari acquire timeout already applies
+3. applyTimeoutProfile(c, profile)               // ← update profile HERE
+4. PreparedStatement ps = c.prepareStatement(...)
+5. applyStatementTimeout(ps, profile)            // statement-level where needed
+6. startQueryDeadlineWatchdog(ps, profile)       // NP: ms cancel; bulk: optional
+7. ps.executeQuery() / executeUpdate()
+8. consume results
+9. finally:
+     stopWatchdog()
+     resetTimeoutProfile(c)                      // mandatory before return
+     ps.close()
+     c.close()                                   // return to Hikari
+```
+
+##### What to set where
+
+| Knob | When to set | NP | Bulk DML |
+| --- | --- | --- | --- |
+| Hikari `connectionTimeout` | Pool create only | 50 ms (NP pools) | 1–5 s (BULK pools) |
+| JDBC URL `socketTimeout` | Pool/URL create only | 2 s safety net | 60 s safety net |
+| `Connection.setNetworkTimeout(executor, ms)` | **Before query** (step 3) | 100–200 ms ceiling | 30_000–120_000 ms |
+| `Statement.setQueryTimeout(seconds)` | **Before execute** (step 5) | Prefer **unset/0** + ms watchdog | **5–30** seconds |
+| App cancel watchdog | **Before execute** (step 6) | **15–20 ms** → `ps.cancel()` | Optional (e.g. batch wall clock) |
+| `SET statement_timeout` (PG GUC) | Optional in step 3 | Usually skip | Optional mirror of bulk budget |
+
+##### Suggested helper API (design)
+
+```java
+public final class TimeoutProfile {
+  public enum Kind { NP_LOOKUP, BULK_DML, OAM_READ }
+
+  public final Kind kind;
+  public final int networkTimeoutMs;   // Connection.setNetworkTimeout
+  public final int queryTimeoutSec;    // Statement.setQueryTimeout; 0 = leave unset
+  public final int deadlineMs;         // app watchdog; 0 = disabled
+
+  public static final TimeoutProfile NP =
+      new TimeoutProfile(Kind.NP_LOOKUP, 200, 0, 20);
+  public static final TimeoutProfile BULK =
+      new TimeoutProfile(Kind.BULK_DML, 60_000, 30, 0);
 }
 
-void reset(Connection c, Executor ex) {
-  c.setNetworkTimeout(ex, 0);   // clear before return to pool
+public final class TimeoutProfileApplier {
+  private final Executor timeoutExecutor; // dedicated, not worker threads
+
+  public void apply(Connection c, TimeoutProfile p) throws SQLException {
+    // Update connection-level profile BEFORE creating/executing the statement
+    c.setNetworkTimeout(timeoutExecutor, p.networkTimeoutMs);
+  }
+
+  public void apply(Statement s, TimeoutProfile p) throws SQLException {
+    if (p.queryTimeoutSec > 0) {
+      s.setQueryTimeout(p.queryTimeoutSec);
+    } else {
+      s.setQueryTimeout(0); // disabled; NP uses watchdog instead
+    }
+  }
+
+  public void reset(Connection c) throws SQLException {
+    // Prevent next borrower (especially NP) from inheriting bulk timeouts
+    c.setNetworkTimeout(timeoutExecutor, 0);
+  }
 }
 ```
 
-Bulk path may also set session GUCs when appropriate (e.g. `SET statement_timeout = '30s'`) inside the borrow and reset on return — still does **not** replace separate pools for acquire isolation.
+##### Call site pattern (before query)
+
+**NP lookup (separate NP pool — recommended):**
+
+```java
+TimeoutProfile profile = TimeoutProfile.NP;
+try (Connection c = npDataSource.getConnection()) {
+  timeoutApplier.apply(c, profile);                 // before query
+  try (PreparedStatement ps = c.prepareStatement(NP_SQL)) {
+    timeoutApplier.apply(ps, profile);
+    ps.setString(1, subscriberNumber);
+    try (QueryDeadline d = QueryDeadline.start(ps, profile.deadlineMs)) {
+      try (ResultSet rs = ps.executeQuery()) {
+        return map(rs);
+      }
+    }
+  }
+} finally {
+  // if not using try-with-resources for Connection alone, always:
+  // timeoutApplier.reset(c);
+}
+```
+
+With try-with-resources, prefer a small wrapper so **reset always runs**:
+
+```java
+try (ProfiledConnection pc = ProfiledConnection.borrow(npDataSource, TimeoutProfile.NP, timeoutApplier)) {
+  // apply() already done inside borrow()
+  try (PreparedStatement ps = pc.connection().prepareStatement(NP_SQL)) {
+    timeoutApplier.apply(ps, TimeoutProfile.NP);
+    ...
+  }
+} // close() → reset(connection) then connection.close()
+```
+
+**Bulk add/modify/delete (BULK pool):**
+
+```java
+try (ProfiledConnection pc = ProfiledConnection.borrow(bulkPrimaryDs, TimeoutProfile.BULK, timeoutApplier)) {
+  try (PreparedStatement ps = pc.connection().prepareStatement(UPSERT_SQL)) {
+    timeoutApplier.apply(ps, TimeoutProfile.BULK); // setQueryTimeout(30) before execute
+    // bind … batch …
+    ps.executeBatch();  // or executeUpdate()
+  }
+} // reset + return to pool
+```
+
+##### `QueryDeadline` (NP ms budget)
+
+JDBC `setQueryTimeout` cannot express &lt;20 ms. Before `executeQuery()`:
+
+```text
+deadline = now + 20ms
+schedule on timeoutExecutor:
+  if still running → PreparedStatement.cancel()
+executeQuery()
+cancel scheduled task on completion
+```
+
+On cancel/`SQLException`: treat as infra failure if connection is broken; quarantine + failover per §6.3.
+
+##### Reset rules (critical)
+
+| Rule | Why |
+| --- | --- |
+| Always `setNetworkTimeout(executor, 0)` before return | Next NP borrow must not inherit 60 s bulk network timeout |
+| Do not rely on pool to clear statement timeouts | New `PreparedStatement` each time is OK; connection-level state **persists** |
+| Reset in `finally` / wrapper `close()` | Exceptions must not skip reset |
+| Never call `setNetworkTimeout` from random app threads without a stable `Executor` | JDBC requires an executor for async abort |
+
+##### What not to do
+
+| Anti-pattern | Problem |
+| --- | --- |
+| Change Hikari `connectionTimeout` per query | Not supported; pool-wide only |
+| Put bulk `socketTimeout` on the NP pool URL | All NP connections inherit seconds-level hang |
+| Apply bulk profile and return connection without reset | Contaminates NP path |
+| Use worker thread as `setNetworkTimeout` executor | Can deadlock / starve workers |
+| Set NP `Statement.setQueryTimeout(1)` expecting 20 ms | Unit is **seconds** — minimum practical 1 s |
+
+##### With separate NP vs BULK pools (default)
+
+Still **apply a profile before every query**:
+
+- NP pool: short network ceiling + 20 ms watchdog  
+- BULK pool: long network + `setQueryTimeout` in seconds  
+
+Pool family chooses **acquire** behavior; profile chooses **in-query** behavior. Both layers are required.
+
+---
 
 #### 5.6.4 Failover / retry differences
 
@@ -969,6 +1108,7 @@ NpDbClient.shutdown()
 | 0.6 | 2026-07-13 | §6.5: minimize loss in worker-detect → management-process lag via atomic routing quarantine |
 | 0.7 | 2026-07-13 | FR-11 boot with all DB down; production Hikari/JDBC review for long TCP, fast loss detect, &lt;20 ms |
 | 0.8 | 2026-07-13 | §5.6: different timeouts for bulk add/modify/delete vs NP via separate Hikari pool families |
+| 0.9 | 2026-07-13 | §5.6.3: concrete apply/reset timeout profile before query pattern |
 
 ---
 
