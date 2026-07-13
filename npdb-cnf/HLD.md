@@ -562,6 +562,7 @@ NpDbClient.shutdown()
 | OD-06 | NP intra-request failover | Required for zero msg failure? | **Yes (max 2 alternates)** |
 | OD-07 | Latency SLO | &lt;20 ms vs &lt;200 ms | **Confirmed: &lt; 20 ms** |
 | OD-08 | Planned drain signal | Ops API / CNPG hook / reactive only | **Support API + reactive** |
+| OD-09 | UP gating | Single probe vs N probes + warm | **N probes + warm** |
 | OD-10 | Last UP pool also down | Keep in RR vs fail-fast | **Confirmed: fail-fast + CRITICAL + SLP broadcast (§6.4)** |
 
 ---
