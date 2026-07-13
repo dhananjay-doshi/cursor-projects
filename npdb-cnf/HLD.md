@@ -7,7 +7,7 @@
 | Target runtime | Java (CNF / Kubernetes) |
 | Connection pool | HikariCP |
 | Database | PostgreSQL (1 Primary + 2 Replica), Multus static IPs |
-| Status | **Draft v0.5 — &lt;20 ms SLO + last-pool-down fail-fast policy confirmed** |
+| Status | **Draft v0.6 — atomic quarantine closes worker→management event lag window (§6.5)** |
 | Audience | Architecture, Development, SRE / Ops |
 | Related | [`DESIGN_REVIEW.md`](./DESIGN_REVIEW.md) |
 
@@ -82,7 +82,7 @@ Design a production-ready, telco-grade Java connection-management module that le
 | FR-08b | Service OAM may use up to 2 alternate-pool attempts |
 | FR-09 | Metrics: queries/pool/connection, failed/available, transitions |
 | FR-10 | Postgres restart: equal LB on survivors; no NP message loss if ≥1 other pool healthy |
-| FR-12 | When **zero** pools are UP: fail fast (no borrow); CRITICAL alarm; SLP broadcast; monitor-driven recovery only | **CONFIRMED** |
+| FR-13 | On infra failure: **quarantine routing eligibility atomically before/without waiting for Management**; event queue used for alarms/SLP only |
 
 ### 2.2 Non-Functional
 
@@ -366,6 +366,117 @@ When Management broadcasts **all pools DOWN**:
 
 Service OAM may still attempt its max-2 alternate-pool policy, but with zero UP pools it must likewise fail fast after selector returns null (no point burning OAM threads on DOWN pools).
 
+### 6.5 Closing the Worker→Management Event Lag Window
+
+#### Problem
+
+```
+t0  Worker-A detects connection loss on Pool-X
+t1  Worker-A enqueues DbEvent(Pool-X DOWN)     ← event posted
+t2  … Management thread has NOT yet dequeued/processed …
+t3  Worker-B / Worker-C still see Pool-X as UP → RR selects X → MORE message loss
+t4  Management processes event → marks Pool-X DOWN
+```
+
+If routing eligibility waits for Management, **every query that selects Pool-X in [t1, t4]** can fail. Under 5k qps that window can mean hundreds of lost messages even if Management is only a few milliseconds late.
+
+#### Principle: split data-plane routing from control-plane authority
+
+| View | Owner | Purpose | Updated when |
+| --- | --- | --- | --- |
+| **Routing eligibility mask** | Shared atomic structure read by **all workers** | Who may be selected by RR / failover | **Immediately** on detect (before or without waiting for Management) |
+| **Authoritative pool FSM** | Management thread only | Alarms, SLP broadcast, confirmed UP/DOWN/RECOVERING | When event is processed |
+
+Management remains the only writer of alarms/SLP status. Workers are allowed to **clear eligibility bits** (quarantine) instantly. Only Management (or monitor recovery path via Management) **sets eligibility back to UP**.
+
+#### Required order of operations in the detecting worker
+
+```
+on infra failure for Pool-X:
+  1. CAS / atomic quarantine(Pool-X)     // eligibility bit OFF — visible to all workers NOW
+  2. enqueue DbEvent(Pool-X, DRAINING/DOWN)  // control plane (may lag)
+  3. failover: nextUpPool() among still-eligible pools
+  4. return success or NPDB_ALL_POOLS_UNAVAILABLE
+```
+
+**Never** enqueue first and quarantine only after Management acknowledges.
+
+#### Suggested shared structure (illustrative)
+
+```text
+class HealthyPoolSelector {
+  // bit0=Primary, bit1=R1, bit2=R2; 1 = eligible for RR
+  final AtomicInteger eligibilityMask;   // workers: clear bits only
+  final AtomicInteger rrCursor;
+
+  PoolId nextUpPool() {
+    // read mask once; RR among bits that are set; skip ineligible
+  }
+
+  boolean quarantine(PoolId id) {
+    // CAS clear bit; return true if this caller transitioned 1→0 (first detector)
+  }
+
+  // called ONLY from Management after gated recovery
+  void markEligible(PoolId id) { /* CAS set bit */ }
+}
+```
+
+Illustrative Java shape:
+
+```java
+// First detector wins; others are no-ops for the bit clear
+int bit = 1 << poolOrdinal;
+int prev = eligibilityMask.getAndUpdate(m -> m & ~bit);
+boolean firstToQuarantine = (prev & bit) != 0;
+if (firstToQuarantine) {
+  eventQueue.offer(DbEvent.down(poolId, cause)); // coalesce-friendly
+}
+```
+
+#### How this minimizes message loss
+
+| Mechanism | Effect on [t1, t4] window |
+| --- | --- |
+| **1. Atomic quarantine before enqueue** | Other workers stop selecting Pool-X on the **next** `nextUpPool()` call — typically microseconds, not Management latency |
+| **2. Intra-request failover (OD-06)** | The detecting worker’s **own** message is saved on another UP pool |
+| **3. First-detector-only event** | Avoids flooding the queue; Management still sees one DOWN |
+| **4. Event coalescing in queue** | Multiple late detects for same pool collapse to one FSM transition |
+| **5. Short NP timeouts** | Any in-flight borrow already on Pool-X fails fast and also quarantines (idempotent) + failovers |
+| **6. Management lag becomes harmless for routing** | Lag only delays alarm/SLP broadcast, not RR exclusion |
+
+```
+Without atomic quarantine:
+  detect → enqueue ~~~~~~~~~~ Management ──► DOWN
+              └── other workers still hit Pool-X ──► message loss
+
+With atomic quarantine:
+  detect → quarantine (mask) ──► all workers skip Pool-X immediately
+        → enqueue ~~~~~~~~~~ Management ──► alarm/SLP only
+        → failover same request ──► success if ≥1 other UP
+```
+
+#### What Management still does (after the lag)
+
+1. Confirm FSM: DRAINING/DOWN  
+2. Raise alarm / clear as appropriate  
+3. Broadcast to SLP (may be slightly delayed — acceptable; routing already correct)  
+4. **Never** auto-clear quarantine from a worker path  
+5. On monitor recovery: RECOVERING → gated UP → `markEligible(pool)` so RR re-admits the pool
+
+#### Residual unavoidable loss
+
+Atomic quarantine does **not** save:
+
+- Queries **already executing** on Pool-X when it dies (in-flight) — those fail; failover applies only if the worker catches the error and alternates  
+- Queries that selected Pool-X **in the same nanoseconds** before the CAS becomes visible — vanishingly small vs queue lag  
+- The case when **no other pool is UP** (§6.4)
+
+#### Design rule (normative)
+
+> **Routing decisions must not wait on the Management event queue.**  
+> The queue is for **control-plane side effects** (FSM confirmation, alarms, SLP broadcast), not for making a dead pool unselectable.
+
 ---
 
 ## 7. Pool Status Management
@@ -400,6 +511,8 @@ Workers / Monitoring → BlockingQueue<DBEvent> → Management
 ```
 
 Coalesce duplicate UPs; never drop the first DOWN. Periodic status heartbeat (1–2 s) prevents SLP divergence.
+
+**Important:** Enqueueing an event does **not** make the pool unselectable. That is done by **atomic quarantine on the routing mask** (§6.5) so Management processing lag cannot cause additional RR selections of the dead pool.
 
 ### 7.3 Detection Sources
 
@@ -605,6 +718,7 @@ NpDbClient.shutdown()
 | 0.3 | 2026-07-13 | Confirmed query response time SLO: **&lt; 20 ms** (OD-07 closed) |
 | 0.4 | 2026-07-13 | Last remaining UP pool down: fail-fast policy (§6.4 / §20.7) |
 | 0.5 | 2026-07-13 | **Confirmed** last-pool-down fail-fast + CRITICAL alarm/SLP broadcast (OD-10 / FR-12) |
+| 0.6 | 2026-07-13 | §6.5: minimize loss in worker-detect → management-process lag via atomic routing quarantine |
 
 ---
 
