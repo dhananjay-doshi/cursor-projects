@@ -7,7 +7,7 @@
 | Target runtime | Java (CNF / Kubernetes) |
 | Connection pool | HikariCP |
 | Database | PostgreSQL (1 Primary + 2 Replica), Multus static IPs |
-| Status | **Draft v0.10 — single shared-pool NP+bulk mode documented (§5.6.2)** |
+| Status | **Draft v0.11 — DB Handler vs Service OAM two-module model (§3.3, §5.7)** |
 | Audience | Architecture, Development, SRE / Ops |
 | Related | [`DESIGN_REVIEW.md`](./DESIGN_REVIEW.md) |
 
@@ -36,7 +36,8 @@ Design a production-ready, telco-grade Java connection-management module that le
 | Fair query distribution across healthy DB instances (incl. restart) | Yes |
 | Worker / management / monitoring thread model | Yes |
 | Borrow/return connections + driver PreparedStatement cache | Yes |
-| Separate timeout profiles / pool families for NP vs bulk DML | Yes |
+| Common DB connector used by DB Handler + Service OAM | Yes |
+| Service OAM single DML, bulk (50M), audit timeout/pool guidance | Yes |
 | Instant quarantine + intra-request pool failover on infra failure | Yes |
 | Planned drain / gated recovery for Postgres restart | Yes |
 | Connection up/down events → management → alarms / SLP broadcast | Yes |
@@ -121,26 +122,49 @@ Design a production-ready, telco-grade Java connection-management module that le
 ### 3.2 Target (CNF — separate pods)
 
 ```
-                    ┌──────────────────────┐
-                    │  App Client Pod      │
-                    │  DB connector        │
-                    │  16 workers          │
-                    │  1 management        │
-                    │  1 monitoring        │
-                    │  3× HikariCP (max17) │
-                    └──────────┬───────────┘
-           Multus static IPs   │
-        ┌──────────────────────┼──────────────────────┐
-        ▼                      ▼                      ▼
-┌───────────────┐      ┌───────────────┐      ┌───────────────┐
-│ PG Primary    │      │ PG Replica-1  │      │ PG Replica-2  │
-│ Multus IP #1  │      │ Multus IP #2  │      │ Multus IP #3  │
-└───────────────┘      └───────────────┘      └───────────────┘
+┌────────────────────────────┐
+│  DB Handler pod            │
+│  5K SELECT/sec, &lt;20 ms     │
+│  16 workers + mgmt/monitor │
+│  Hikari NP ×3 (max 17)     │
+└──────────────┬─────────────┘
+               │ Multus static IPs
+    ┌──────────┼──────────┐
+    ▼          ▼          ▼
+ PG Primary  Replica-1  Replica-2
+    ▲          ▲          ▲
+    └──────────┼──────────┘
+               │ Multus static IPs (same)
+┌──────────────┴─────────────┐
+│  Service OAM pod           │
+│  Single I/U/D + bulk/audit │
+│  Hikari OAM ×3 (max 3)     │
+│  longer timeouts + retry   │
+└────────────────────────────┘
 ```
+
+### 3.3 Modules: DB Handler vs Service OAM
+
+Database access is split across **two processes** (two Deployments). They use a **common DB connector** library and the same Multus Postgres IPs, but **separate JVMs ⇒ separate Hikari pools**. Provisioning cannot steal connections from the 5K select path.
+
+| Dimension | **DB Handler** | **Service OAM** |
+| --- | --- | --- |
+| Purpose | Real-time NP **SELECT** (subscriber / routing) | Subscriber **provisioning** &amp; maintenance |
+| Workloads | ≥ **5,000** lookups/sec, **&lt; 20 ms** | (1) Single `INSERT`/`UPDATE`/`DELETE` (2) **Bulk** load (e.g. **50M** rows) (3) **DB audit** |
+| Hikari per PG pod | **min=max=17**, acquire **~50 ms** | **min=max=3**, acquire **1–5 s** |
+| Routing | RR across UP primary + replicas | **Writes → PRIMARY**; audit/heavy read may use replicas |
+| Retry | No business retry; infra failover ≤2 pools | Up to **2** infra retries; writes stay on primary |
+| Isolation | Dedicated pools | Dedicated pools — **required** so 50M bulk does not impact 5K selects |
+
+Inside Service OAM, single-row DML vs bulk vs audit share OAM pools and use different **timeout profiles** (§5.6.3, §5.7) — not DB Handler’s pools.
+
+**Note:** “One pool for NP + bulk” only matters if both ran in one JVM. With two modules as above, that anti-pattern is already avoided across processes.
 
 ---
 
 ## 4. Logical Architecture
+
+> Primary diagram below is **DB Handler** (5K SELECT path). Service OAM uses the same connector patterns with smaller pools and write-oriented routing (§3.3, §5.7).
 
 ### 4.1 Component View
 
@@ -348,9 +372,11 @@ Borrow connection → driver-cached / server-side prepared statement (`prepareTh
 
 No application-owned PreparedStatement cache across pool returns.
 
-### 5.6 Different Timeouts for NP Lookups vs Bulk Provisioning (Same Postgres / Hikari)
+### 5.6 Different Timeouts: DB Handler (SELECT) vs Service OAM (Provisioning)
 
-Bulk subscriber **add / modify / delete** needs longer SQL and acquire budgets than NP lookups (&lt; 20 ms). HikariCP attaches **`connectionTimeout` (and the JDBC URL) to the pool**, not to each borrow — so you cannot configure two Hikari acquire timeouts on **one** `HikariDataSource`.
+**DB Handler** and **Service OAM** are separate processes (§3.3) ⇒ separate Hikari instances. Timeout families below map to those modules—not to two logical pools inside one NP JVM unless OAM is co-located (not recommended).
+
+HikariCP attaches **`connectionTimeout` (and the JDBC URL) to the pool**, not to each borrow — so within **one** process you still cannot have two Hikari acquire timeouts on one `HikariDataSource` without two pools.
 
 #### 5.6.1 Recommended approach: **two pool families** to the same Multus IPs
 
@@ -636,7 +662,36 @@ Pool family chooses **acquire** behavior; profile chooses **in-query** behavior.
 | **A. Separate NP + BULK Hikari families** (same Multus IPs) | **Recommended / default** |
 | B. Single shared pool + per-borrow profiles + bulk concurrency cap | Fallback only |
 
-Open decision **OD-13**: confirm separate BULK pools (size 3) vs shared pool.
+Open decision **OD-13**: confirm separate OAM pools in Service OAM process (max 3) — **default yes**; DB Handler never shares pools with OAM.
+
+### 5.7 Service OAM Workloads on OAM Pools (Single vs Bulk vs Audit)
+
+Service OAM uses **its own** Hikari pools (not DB Handler’s). Within OAM, apply a timeout profile **before each query** (§5.6.3).
+
+| Workload | SQL pattern | Pool target | Timeout profile (illustrative) | Notes |
+| --- | --- | --- | --- | --- |
+| **Single I/U/D** | One row insert/update/delete | **PRIMARY** | network 5–10 s; `setQueryTimeout` 5–10 s | OAM retry ≤2 on infra error; keep transactions short |
+| **Bulk provision** (e.g. 50M subscribers) | Batched multi-row DML | **PRIMARY** | network 60–120 s; `setQueryTimeout` 30–60 s **per batch** | Never one transaction for 50M rows |
+| **DB audit** | Long read / compare queries | PRIMARY or replica | network 60–300 s; query timeout per statement | Prefer replica to spare primary write capacity |
+
+#### Bulk 50M — connection usage rules
+
+1. **Chunk** into batches (e.g. 1K–10K rows / `executeBatch`); commit per chunk.  
+2. **Borrow → apply BULK profile → execute batch → reset → close** per chunk (or small group of chunks), not for the entire 50M job.  
+3. **Limit in-flight bulk connections** to ≤ pool size (typically **1–2** concurrent bulk workers) so single I/U/D and audit still get a connection from max=3.  
+4. **Checkpoint** progress (last key / offset) for restart after failure.  
+5. **Do not** lower DB Handler pool sizes during bulk — separate process already isolates selects.  
+6. Watch Postgres: WAL, CPU, replication lag; throttle bulk if replicas lag impacts DB Handler reads (ops policy).  
+7. Optional: schedule huge loads in maintenance windows; still keep DB Handler up with `initializationFailTimeout=0` semantics unchanged.
+
+#### OAM pool sizing reminder
+
+| Setting | OAM value | Why |
+| --- | --- | --- |
+| `maximumPoolSize` / `minimumIdle` | **3 / 3** | 1 interactive/single DML + 1 bulk + 1 monitor (stakeholder) |
+| `connectionTimeout` | **1000–5000 ms** | Provisioning can wait; not on &lt;20 ms path |
+| `initializationFailTimeout` | **0** | OAM process also starts if Postgres is down |
+| `maxLifetimeTime` | **0** | Long-lived TCP, same rationale as NP |
 
 ---
 
@@ -1057,10 +1112,23 @@ NpDbClient.shutdown()
 
 ## 13. Deployment View (CNF)
 
-- App client Deployment with Multus NAD; secrets for DB credentials.
-- Three Postgres pods with static Multus IPs.
-- NetworkPolicy + `pg_hba` allow client Multus CIDR.
-- Guardrail: avoid draining/restarting more than one NP DB pod at a time unless forced.
+```
+┌─────────────────────┐   ┌─────────────────────┐
+│ DB Handler Deploy   │   │ Service OAM Deploy  │
+│ Multus NAD + secrets│   │ Multus NAD + secrets│
+│ NP Hikari ×3        │   │ OAM Hikari ×3       │
+└──────────┬──────────┘   └──────────┬──────────┘
+           │                         │
+           └────────────┬────────────┘
+                        ▼
+              PG Primary + 2 Replicas
+                 (Multus static IPs)
+```
+
+- NetworkPolicy + `pg_hba` allow both client Multus CIDRs to Postgres.  
+- Postgres `max_connections` must cover **(17×3 × DB Handler replicas) + (3×3 × OAM replicas) + platform**.  
+- Guardrail: avoid restarting all three PG pods concurrently.  
+- Bulk 50M jobs run only in **Service OAM**; never in DB Handler workers.
 
 ---
 
@@ -1087,7 +1155,8 @@ NpDbClient.shutdown()
 | OD-01 | Pool size | 17 per pool vs smaller | **17 / 17** (stakeholder) |
 | OD-11 | `maxLifetimeTime` | 0 (long TCP) vs 30 min recycle | **0** unless firewall requires otherwise |
 | OD-12 | `keepaliveTime` | 15s / 20s / 30s | **20000 ms** |
-| OD-13 | Bulk vs NP timeouts | Separate Hikari families vs shared pool + overlay | **Separate BULK pools (max 3) — §5.6** |
+| OD-13 | OAM vs Handler pools | Separate processes/pools vs co-located shared | **Separate processes + OAM pools max 3 (§3.3, §5.7)** |
+| OD-14 | Bulk batch size / concurrency | Tune in soak | **Start 1K–10K rows/batch, ≤2 bulk in-flight** |
 | OD-02 | Include Primary in RR | Yes / replicas-only | **Yes — all 3** |
 | OD-03 | Connection model | Borrow/return vs leased slots | **Borrow/return** |
 | OD-04 | Metrics backend | Micrometer / JMX / legacy | **JMX + Micrometer if available** |
@@ -1143,6 +1212,7 @@ NpDbClient.shutdown()
 | 0.8 | 2026-07-13 | §5.6: different timeouts for bulk add/modify/delete vs NP via separate Hikari pool families |
 | 0.9 | 2026-07-13 | §5.6.3: concrete apply/reset timeout profile before query pattern |
 | 0.10 | 2026-07-13 | §5.6.2: expanded single shared-pool behavior for NP + bulk |
+| 0.11 | 2026-07-13 | §3.3 / §5.7: DB Handler (5K SELECT) vs Service OAM (single IUD, 50M bulk, audit) |
 
 ---
 
@@ -1157,7 +1227,8 @@ Confirm before implementation:
 5. Multus static IP–only JDBC URLs  
 7. Client init with all Postgres pods down + Hikari background reconnect — **CONFIRMED** (FR-11 / §5.2)  
 8. Production property set in §5.4 (esp. `maxLifetimeTime=0`, `connectionTimeout=50ms`, `tcpNoDelay`, ms query deadline) — review/approve  
-9. Bulk DML timeouts: **separate BULK Hikari pools** (§5.6 / OD-13) — confirm  
+9. DB Handler vs Service OAM as **separate processes/pools** (§3.3) — confirm  
+10. OAM bulk 50M chunking + timeout profiles (§5.7 / OD-14) — confirm  
 
 ---
 
