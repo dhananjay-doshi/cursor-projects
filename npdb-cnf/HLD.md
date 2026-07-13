@@ -7,7 +7,7 @@
 | Target runtime | Java (CNF / Kubernetes) |
 | Connection pool | HikariCP |
 | Database | PostgreSQL (1 Primary + 2 Replica), Multus static IPs |
-| Status | **Draft v0.9 — timeout profile apply/reset-before-query guidance (§5.6.3)** |
+| Status | **Draft v0.10 — single shared-pool NP+bulk mode documented (§5.6.2)** |
 | Audience | Architecture, Development, SRE / Ops |
 | Related | [`DESIGN_REVIEW.md`](./DESIGN_REVIEW.md) |
 
@@ -397,32 +397,65 @@ Shared across both families:
 | NP &lt;20 ms SLO under bulk load | Protected | Easily broken |
 | Postgres `max_connections` | 17×3 + 3×3 = **60**/client process | Lower total, but coupled risk |
 
-#### 5.6.2 Alternative: **one shared pool** + per-operation timeout overlay
+#### 5.6.2 When a **single pool** is used for NP **and** bulk
 
-Use only if connection budget is extremely tight and bulk concurrency is strictly limited.
+If product constraint is “one HikariCP pool (per Postgres pod) for both normal lookups and bulk add/modify/delete,” accept these facts:
+
+| Fact | Implication |
+| --- | --- |
+| One `connectionTimeout` | Acquire wait is **identical** for NP and bulk (must pick a compromise, e.g. 200–500 ms) |
+| One JDBC URL / `socketTimeout` | Hard socket safety net is **identical** (pick bulk-oriented, e.g. 60 s, or NP-oriented 2 s — not both) |
+| Connections are fungible | A bulk op can occupy a connection that an NP worker wanted → risk to **&lt;20 ms** and 5k qps |
+| In-query timeouts can still differ | After `getConnection()`, apply **NP vs BULK profile** before execute (§5.6.3), then **reset** on return |
 
 ```
-getConnection()                    // same Hikari connectionTimeout for everyone
-  → applyTimeoutProfile(opType)    // per borrow
-  → execute
-  → resetTimeoutProfile()          // before close()/return to pool
-  → connection.close()
+                    ┌──────────────────────┐
+                    │ Single Hikari pool   │  per Multus IP
+                    │ connectionTimeout=X  │  ← one value for everyone
+                    │ maxPoolSize=17       │
+                    └──────────┬───────────┘
+               borrow│         │borrow
+         ┌───────────┘         └───────────┐
+         ▼                                 ▼
+  NP worker                          Bulk/OAM thread
+  apply(NP profile)                  apply(BULK profile)
+  execute lookup                     execute DML/batch
+  reset + close()                    reset + close()
 ```
 
-| Layer | NP profile | Bulk profile |
+##### Mandatory controls for single-pool mode
+
+1. **Per-borrow timeout profile** (before query) — only way to differentiate NP vs bulk once connected.  
+2. **Reset profile on return** — or the next NP borrow inherits bulk `setNetworkTimeout`.  
+3. **Cap bulk concurrency** — e.g. semaphore `maxInFlightBulk = 1 or 2` so bulk cannot take most of the 17 connections.  
+4. **Chunk bulk work** — short transactions; do not hold a borrowed connection across large file parsing pauses.  
+5. **Prefer PRIMARY for bulk writes**; NP may still RR including replicas **on the same pools** (writes and reads share capacity).  
+6. **Compromise acquire timeout** — e.g. **300 ms**: slower than ideal NP fail-fast (50 ms), faster than comfortable bulk (5 s). Document SLO impact.  
+7. **Metrics** — track NP acquire wait, bulk in-flight, NP p99 separately; alert if bulk correlates with NP latency.
+
+##### What single-pool **cannot** do
+
+- Different Hikari `connectionTimeout` for NP vs bulk  
+- Guarantee NP &lt;20 ms while bulk saturates the pool  
+- Isolate bulk connection failures from NP capacity on that pod  
+
+##### Single-pool timeout cheat-sheet
+
+| Knob | Single-pool value | Per-op override |
 | --- | --- | --- |
-| Hikari `connectionTimeout` | Must be a **compromise** (e.g. 200–500 ms) — hurts NP fail-fast **or** bulk acquire under load | Same |
-| After borrow: `Statement.setQueryTimeout(seconds)` | Avoid for &lt;20 ms (1 s min); use ms watchdog | **5–30 s** (or per batch) |
-| After borrow: `Connection.setNetworkTimeout(executor, ms)` | ~100–200 ms ceiling | **30_000–120_000 ms** |
-| App watchdog / cancel | **15–20 ms** | Batch wall-clock (e.g. 60 s) |
-| JDBC URL `socketTimeout` | Still one value — set to **bulk safety net** (e.g. 60 s) or NP net (2 s); cannot be optimal for both | Same |
+| Hikari `connectionTimeout` | **300 ms** compromise (tune) | None |
+| JDBC `socketTimeout` | **60 s** (protect bulk) or **2 s** (protect NP hang) — choose explicitly | None |
+| `setNetworkTimeout` | — | NP **200 ms** / Bulk **60_000 ms** before query |
+| `setQueryTimeout` | — | NP **0** + 20 ms watchdog / Bulk **30 s** before query |
+| Bulk in-flight | — | **≤ 2** (hard) |
 
-**Mandatory if shared pool**
+**HLD preference remains separate pool families (§5.6.1).** Single-pool is a constrained mode with higher risk to the NP latency SLO.
 
-1. **Bound bulk concurrency** (semaphore ≤ 1–2 in-flight bulk ops) so 16 NP workers are not blocked on `getConnection()`.  
-2. **Always reset** network/statement timeouts before returning the connection (otherwise the next NP borrow inherits a long `setNetworkTimeout`).  
-3. Do **not** run large transactions that hold a borrowed connection for minutes without chunking.  
-4. Prefer bulk against **PRIMARY-only** datasource even if NP RRs replicas.
+#### 5.6.2b Alternative label: shared-pool + overlay
+
+Same as §5.6.2: one shared pool + per-borrow timeout overlay + bulk concurrency cap.
+
+---
 
 #### 5.6.3 How to update the timeout profile **before** the query
 
@@ -1109,6 +1142,7 @@ NpDbClient.shutdown()
 | 0.7 | 2026-07-13 | FR-11 boot with all DB down; production Hikari/JDBC review for long TCP, fast loss detect, &lt;20 ms |
 | 0.8 | 2026-07-13 | §5.6: different timeouts for bulk add/modify/delete vs NP via separate Hikari pool families |
 | 0.9 | 2026-07-13 | §5.6.3: concrete apply/reset timeout profile before query pattern |
+| 0.10 | 2026-07-13 | §5.6.2: expanded single shared-pool behavior for NP + bulk |
 
 ---
 
