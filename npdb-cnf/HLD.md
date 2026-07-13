@@ -653,7 +653,8 @@ NpDbClient.shutdown()
 
 | Risk | Mitigation |
 | --- | --- |
-| Restart failure window while pool still UP | Atomic quarantine + intra-request failover (§20) |
+| Restart failure window while pool still UP | Atomic routing quarantine **before** event enqueue + intra-request failover (§6.5, §20) |
+| Management event lag after worker detect | Eligibility mask cleared in detecting worker; queue lag only delays alarm/SLP (§6.5) |
 | Early UP after restart | RECOVERING + N probes + minIdle warm |
 | Timeouts ≫ latency SLO | NP-specific short timeouts |
 | 51 client connections | DBA approval of `max_connections` |
