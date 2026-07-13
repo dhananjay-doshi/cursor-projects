@@ -7,7 +7,7 @@
 | Target runtime | Java (CNF / Kubernetes) |
 | Connection pool | HikariCP |
 | Database | PostgreSQL (1 Primary + 2 Replica), Multus static IPs |
-| Status | **Draft v0.4 — &lt;20 ms SLO confirmed; last-pool-down policy added** |
+| Status | **Draft v0.5 — &lt;20 ms SLO + last-pool-down fail-fast policy confirmed** |
 | Audience | Architecture, Development, SRE / Ops |
 | Related | [`DESIGN_REVIEW.md`](./DESIGN_REVIEW.md) |
 
