@@ -36,6 +36,7 @@ Design a production-ready, telco-grade Java connection-management module that le
 | Fair query distribution across healthy DB instances (incl. restart) | Yes |
 | Worker / management / monitoring thread model | Yes |
 | Borrow/return connections + driver PreparedStatement cache | Yes |
+| Separate timeout profiles / pool families for NP vs bulk DML | Yes |
 | Instant quarantine + intra-request pool failover on infra failure | Yes |
 | Planned drain / gated recovery for Postgres restart | Yes |
 | Connection up/down events → management → alarms / SLP broadcast | Yes |
@@ -346,6 +347,124 @@ Because JDBC `socketTimeout` / `setQueryTimeout` are **second-granularity**, the
 Borrow connection → driver-cached / server-side prepared statement (`prepareThreshold=1`) → `close()` returns connection to Hikari (**TCP session kept** in pool).
 
 No application-owned PreparedStatement cache across pool returns.
+
+### 5.6 Different Timeouts for NP Lookups vs Bulk Provisioning (Same Postgres / Hikari)
+
+Bulk subscriber **add / modify / delete** needs longer SQL and acquire budgets than NP lookups (&lt; 20 ms). HikariCP attaches **`connectionTimeout` (and the JDBC URL) to the pool**, not to each borrow — so you cannot configure two Hikari acquire timeouts on **one** `HikariDataSource`.
+
+#### 5.6.1 Recommended approach: **two pool families** to the same Multus IPs
+
+```
+                    ┌─────────────────────────┐
+                    │ HealthyPoolSelector (NP)│  RR + quarantine + &lt;20 ms path
+                    └───────────┬─────────────┘
+          ┌─────────────────────┼─────────────────────┐
+          ▼                     ▼                     ▼
+     NP Hikari×3           NP Hikari×3           NP Hikari×3
+     (max 17, TO=50ms)     …                     …
+          │                     │                     │
+          └──────────┬──────────┴──────────┬──────────┘
+                     │   Multus static IPs │
+          ┌──────────┴──────────┬──────────┴──────────┐
+          ▼                     ▼                     ▼
+     BULK Hikari×3         BULK Hikari×3         BULK Hikari×3
+     (max 3, TO=1–5s)      …                     …
+          ▲                     ▲                     ▲
+          └─────────────────────┼─────────────────────┘
+                    ┌───────────┴─────────────┐
+                    │ Bulk/OAM DbConnector    │  longer deadlines, OAM retry
+                    └─────────────────────────┘
+```
+
+| Family | Workload | Pool size (per PG pod) | Acquire `connectionTimeout` | Query / network budget | RR / writes |
+| --- | --- | --- | --- | --- | --- |
+| **NP** | Subscriber lookup (workers) | **17 / 17** | **50 ms** | **~15–20 ms** deadline + cancel | RR reads across UP primary+replicas |
+| **BULK / OAM** | Add / modify / delete (and other provisioning) | **3 / 3** (stakeholder OAM note) | **1000–5000 ms** | **seconds** (e.g. `setQueryTimeout` 5–30 s, batch-aware) | Prefer **PRIMARY** for writes; reads optional |
+
+Shared across both families:
+
+- Same Multus static IPs / DB name / credentials (or bulk-specific DB role with DML rights)
+- `initializationFailTimeout = 0`, long-lived TCP (`maxLifetimeTime=0`, `idleTimeout=0`, `tcpKeepAlive`, `tcpNoDelay`)
+- Independent UP/DOWN quarantine optional but recommended (bulk write outage ≠ necessarily NP read outage on replicas)
+
+**Why this is preferred**
+
+| Concern | Separate pools | Single shared pool |
+| --- | --- | --- |
+| Different Hikari `connectionTimeout` | **Yes** — native | **No** — one value for all borrows |
+| Bulk holding connections starves NP | Isolated capacity | High risk under 5k qps |
+| JDBC URL `socketTimeout` | Can differ per family | One URL per pool — coarse for both |
+| NP &lt;20 ms SLO under bulk load | Protected | Easily broken |
+| Postgres `max_connections` | 17×3 + 3×3 = **60**/client process | Lower total, but coupled risk |
+
+#### 5.6.2 Alternative: **one shared pool** + per-operation timeout overlay
+
+Use only if connection budget is extremely tight and bulk concurrency is strictly limited.
+
+```
+getConnection()                    // same Hikari connectionTimeout for everyone
+  → applyTimeoutProfile(opType)    // per borrow
+  → execute
+  → resetTimeoutProfile()          // before close()/return to pool
+  → connection.close()
+```
+
+| Layer | NP profile | Bulk profile |
+| --- | --- | --- |
+| Hikari `connectionTimeout` | Must be a **compromise** (e.g. 200–500 ms) — hurts NP fail-fast **or** bulk acquire under load | Same |
+| After borrow: `Statement.setQueryTimeout(seconds)` | Avoid for &lt;20 ms (1 s min); use ms watchdog | **5–30 s** (or per batch) |
+| After borrow: `Connection.setNetworkTimeout(executor, ms)` | ~100–200 ms ceiling | **30_000–120_000 ms** |
+| App watchdog / cancel | **15–20 ms** | Batch wall-clock (e.g. 60 s) |
+| JDBC URL `socketTimeout` | Still one value — set to **bulk safety net** (e.g. 60 s) or NP net (2 s); cannot be optimal for both | Same |
+
+**Mandatory if shared pool**
+
+1. **Bound bulk concurrency** (semaphore ≤ 1–2 in-flight bulk ops) so 16 NP workers are not blocked on `getConnection()`.  
+2. **Always reset** network/statement timeouts before returning the connection (otherwise the next NP borrow inherits a long `setNetworkTimeout`).  
+3. Do **not** run large transactions that hold a borrowed connection for minutes without chunking.  
+4. Prefer bulk against **PRIMARY-only** datasource even if NP RRs replicas.
+
+#### 5.6.3 How to apply per-borrow timeouts (both approaches)
+
+```text
+enum TimeoutProfile { NP_LOOKUP, BULK_DML, OAM_READ }
+
+void apply(Connection c, TimeoutProfile p, Executor ex) {
+  switch (p) {
+    case NP_LOOKUP:
+      c.setNetworkTimeout(ex, npNetworkCeilingMs);      // e.g. 200
+      // statement: no setQueryTimeout(1s); use 20ms cancel watchdog
+      break;
+    case BULK_DML:
+      c.setNetworkTimeout(ex, bulkNetworkTimeoutMs);    // e.g. 60000
+      // statement.setQueryTimeout(bulkQueryTimeoutSec); // e.g. 30
+      break;
+  }
+}
+
+void reset(Connection c, Executor ex) {
+  c.setNetworkTimeout(ex, 0);   // clear before return to pool
+}
+```
+
+Bulk path may also set session GUCs when appropriate (e.g. `SET statement_timeout = '30s'`) inside the borrow and reset on return — still does **not** replace separate pools for acquire isolation.
+
+#### 5.6.4 Failover / retry differences
+
+| | NP | Bulk / OAM |
+| --- | --- | --- |
+| Infra failure | Atomic quarantine + up to 2 alternate **read** pools | OAM: up to 2 alternate attempts; **writes should stick to PRIMARY** (or documented failover role) |
+| Business SQL error | No retry | Provisioning policy (idempotent retry) |
+| All pools down | `NPDB_ALL_POOLS_UNAVAILABLE` | Same / OAM-specific error; process stays up |
+
+#### 5.6.5 Decision
+
+| Option | HLD default |
+| --- | --- |
+| **A. Separate NP + BULK Hikari families** (same Multus IPs) | **Recommended / default** |
+| B. Single shared pool + per-borrow profiles + bulk concurrency cap | Fallback only |
+
+Open decision **OD-13**: confirm separate BULK pools (size 3) vs shared pool.
 
 ---
 
