@@ -37,7 +37,7 @@ Those gaps are fixable without abandoning the borrow/return + 3-pool model — s
 | Service OAM retry (max 2) | Stated | **Met** (OAM only) |
 | Metrics (queries/connection, failed/available) | Broad metrics list | **Mostly met**; per-connection query counts need care under borrow/return |
 | ≥ 5000 qps | Target stated | **Plausible** with warm pools + RR |
-| Latency | Original brief **&lt; 200 ms**; attached **&lt; 20 ms** | **Tightened**; several timeouts **inconsistent** with &lt; 20 ms (§7) |
+| Latency | **Confirmed: query response time &lt; 20 ms** | **Frozen SLO**; stakeholder timeouts 1–2 s remain **inconsistent** and must be redesigned (§7) |
 | HA / connection re-establishment | Hikari recovery + monitor rejoin | **Partial** — recovery OK; in-flight NP loss not eliminated |
 | Startup when DB down | `initializationFailTimeout = 0` | **Met** (good CNF choice) |
 | App-managed list of 16 pre-prepared connections | Replaced by getConnection()/close() per query | **Intentional design change** — acceptable if PS cache + pool sizing proven |
@@ -224,7 +224,7 @@ Service OAM may use looser timeouts than the NP path.
 | F-06 | Per-connection query metrics under pooling | Medium | Label by pool + connection UUID if required, or by pool only |
 | F-07 | Event queue overload under mass disconnect | Medium | Coalesce per-pool; never drop first DOWN |
 | F-08 | `validationTimeout=250` with `connectionTimeout=1000` | Info | OK ordering; both still high vs &lt;20 ms |
-| F-09 | Original brief latency &lt;200 ms vs attached &lt;20 ms | Info | Freeze official SLO before performance sign-off |
+| F-09 | Latency SLO &lt;20 ms | Info | **Confirmed**; treat as normative for NP path soak tests |
 
 ---
 
@@ -245,7 +245,7 @@ Service OAM may use looser timeouts than the NP path.
 Please confirm:
 
 1. **NP intra-request failover** on infrastructure errors (max 2 alternate pools) — required for “no message failure”?  
-2. Official latency SLO: **&lt; 20 ms** or **&lt; 200 ms**?  
+2. Official latency SLO: **&lt; 20 ms** — **CONFIRMED**  
 3. Pool sizing: **17 / 17 / 17** approved by DBA against Postgres capacity?  
 4. Planned restart: will platform provide a **drain signal**, or rely solely on reactive quarantine + failover?  
 5. Accept **DRAINING / RECOVERING** states beyond simple UP/DOWN?
@@ -257,3 +257,4 @@ Please confirm:
 | Version | Date | Notes |
 | --- | --- | --- |
 | 0.1 | 2026-07-13 | Initial review of stakeholder CNF design; restart / equal-LB / no-message-failure analysis |
+| 0.2 | 2026-07-13 | OD-07 closed: query response time requirement confirmed as &lt; 20 ms |

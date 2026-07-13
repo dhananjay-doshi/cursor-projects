@@ -7,7 +7,7 @@
 | Target runtime | Java (CNF / Kubernetes) |
 | Connection pool | HikariCP |
 | Database | PostgreSQL (1 Primary + 2 Replica), Multus static IPs |
-| Status | **Draft v0.2 — stakeholder design reviewed; restart / zero-failure controls added** |
+| Status | **Draft v0.3 — query response time SLO confirmed (&lt; 20 ms); awaiting remaining OD confirmations** |
 | Audience | Architecture, Development, SRE / Ops |
 | Related | [`DESIGN_REVIEW.md`](./DESIGN_REVIEW.md) |
 
@@ -20,7 +20,7 @@
 Design a production-ready, telco-grade Java connection-management module that lets the Number Portability (NP) application client query subscriber and routing-number data stored in PostgreSQL, when the client and databases run on **separate Kubernetes pods**, while meeting:
 
 - **Throughput**: ≥ **5,000 queries/sec**
-- **Latency**: query path **&lt; 20 ms** (stakeholder CNF design; original brief stated &lt; 200 ms — freeze via OD-07)
+- **Latency**: query response time **&lt; 20 ms** (**confirmed** requirement)
 - **High availability**: survive single DB-pod loss / restart without losing overall query capability
 - **Equal load distribution** across healthy PostgreSQL instances, including during and after a server restart
 - **No NP message failure** on infrastructure errors when at least one other pool is healthy (intra-request pool failover — §20)
@@ -90,7 +90,7 @@ Design a production-ready, telco-grade Java connection-management module that le
 | --- | --- |
 | NFR-01 | Telco-grade HA, production readiness |
 | NFR-02 | ≥ 5,000 queries/sec |
-| NFR-03 | Query latency &lt; 20 ms (confirm vs original &lt; 200 ms — OD-07) |
+| NFR-03 | Query response time **&lt; 20 ms** (confirmed) |
 | NFR-04 | Low connection-timeout incidence; robust Hikari re-establishment |
 | NFR-05 | Minimize status-message loss for SLP broadcast |
 | NFR-06 | No NP message failure on infra errors when another pool can serve |
@@ -481,7 +481,7 @@ NpDbClient.shutdown()
 | OD-04 | Metrics backend | Micrometer / JMX / legacy | **JMX + Micrometer if available** |
 | OD-05 | Status API | Push + heartbeat | **Push + heartbeat** |
 | OD-06 | NP intra-request failover | Required for zero msg failure? | **Yes (max 2 alternates)** |
-| OD-07 | Latency SLO | &lt;20 ms vs &lt;200 ms | **&lt;20 ms** pending sign-off |
+| OD-07 | Latency SLO | &lt;20 ms vs &lt;200 ms | **Confirmed: &lt; 20 ms** |
 | OD-08 | Planned drain signal | Ops API / CNPG hook / reactive only | **Support API + reactive** |
 | OD-09 | UP gating | Single probe vs N probes + warm | **N probes + warm** |
 
@@ -522,6 +522,7 @@ NpDbClient.shutdown()
 | --- | --- | --- |
 | 0.1 | 2026-07-13 | Initial HLD from original requirements |
 | 0.2 | 2026-07-13 | Aligned to stakeholder design; added restart equal-LB + no message failure controls; see DESIGN_REVIEW.md |
+| 0.3 | 2026-07-13 | Confirmed query response time SLO: **&lt; 20 ms** (OD-07 closed) |
 
 ---
 
@@ -532,7 +533,7 @@ Confirm before implementation:
 1. Borrow/return + 3× Hikari (max 17) + RR on UP pools  
 2. **OD-06** NP intra-request failover for no message failure  
 3. Extended states: UP / DRAINING / DOWN / RECOVERING  
-4. NP timeout alignment to &lt;20 ms (OD-07)  
+4. NP timeout alignment to confirmed **&lt; 20 ms** response-time SLO  
 5. Multus static IP–only JDBC URLs  
 
 ---
