@@ -7,7 +7,7 @@
 | Target runtime | Java (CNF / Kubernetes) |
 | Connection pool | HikariCP |
 | Database | PostgreSQL (1 Primary + 2 Replica), Multus static IPs |
-| Status | **Draft v0.7 — boot-with-DB-down confirmed; production Hikari/JDBC property review** |
+| Status | **Draft v0.8 — dual timeout model for NP vs bulk DML (§5.6)** |
 | Audience | Architecture, Development, SRE / Ops |
 | Related | [`DESIGN_REVIEW.md`](./DESIGN_REVIEW.md) |
 
@@ -245,7 +245,7 @@ All PG pods down at start
 
 **DBA check required** against Postgres `max_connections` (and other clients).
 
-Service OAM may use smaller pools (e.g., min=max=3) per stakeholder note.
+Service OAM / bulk provisioning should use a **separate Hikari family** (e.g., min=max=3 per pod) with longer timeouts — see §5.6. Do not share the NP pool’s 50 ms acquire timeout with bulk DML.
 
 ### 5.4 Production HikariCP + JDBC Property Review (NP)
 
@@ -822,20 +822,38 @@ npdb:
     maxLifetimeTimeMs: 0              # 0 = no periodic recycle (long TCP)
     initializationFailTimeoutMs: 0   # boot with all DB down
     registerMbeans: true
+  bulkPool:                            # separate family (§5.6) — same Multus IPs
+    maximumPoolSize: 3
+    minimumIdle: 3
+    idleTimeoutMs: 0
+    connectionTimeoutMs: 5000        # bulk acquire can wait
+    validationTimeoutMs: 1000
+    keepaliveTimeMs: 20000
+    maxLifetimeTimeMs: 0
+    initializationFailTimeoutMs: 0
+    preferPrimaryForWrites: true
   jdbc:
     tcpKeepAlive: true
     tcpNoDelay: true
     connectTimeoutSec: 1             # background connect only
-    socketTimeoutSec: 2              # hard safety net (seconds!)
+    socketTimeoutSec: 2              # NP family hard safety net (seconds!)
     loginTimeoutSec: 2
     cancelSignalTimeoutSec: 1
     applicationName: npdb-cnf
     prepareThreshold: 1
     preparedStatementCacheQueries: 32
     preparedStatementCacheSizeMiB: 5
+  jdbcBulk:                            # bulk family may use longer socket safety net
+    applicationName: npdb-bulk
+    socketTimeoutSec: 60
+    prepareThreshold: 1
   query:
-    deadlineMs: 20                   # app watchdog + Statement.cancel
-    networkTimeoutCeilingMs: 200     # optional Connection.setNetworkTimeout
+    deadlineMs: 20                   # NP app watchdog + Statement.cancel
+    networkTimeoutCeilingMs: 200     # optional Connection.setNetworkTimeout (NP)
+  bulkQuery:
+    queryTimeoutSec: 30
+    networkTimeoutMs: 60000
+    maxInFlight: 2                   # if ever sharing NP pool (fallback)
   threads:
     workers: 16
     monitoringIntervalMs: 5000
@@ -881,7 +899,8 @@ NpDbClient.shutdown()
 | Restart failure window while pool still UP | Atomic routing quarantine **before** event enqueue + intra-request failover (§6.5, §20) |
 | Management event lag after worker detect | Eligibility mask cleared in detecting worker; queue lag only delays alarm/SLP (§6.5) |
 | Early UP after restart | RECOVERING + N probes + minIdle warm |
-| Timeouts ≫ latency SLO | NP-specific short timeouts |
+| Bulk holds NP pool connections | Separate BULK pool family (§5.6); else cap bulk in-flight |
+| Mixed NP/bulk timeouts on one pool | Hikari `connectionTimeout` is per-pool — use two families or accept compromise |
 | 51 client connections | DBA approval of `max_connections` |
 | Replica lag | Document consistency; optional primary-preferred later |
 | Event queue burst | Coalesce; never drop first DOWN; heartbeat |
@@ -896,6 +915,7 @@ NpDbClient.shutdown()
 | OD-01 | Pool size | 17 per pool vs smaller | **17 / 17** (stakeholder) |
 | OD-11 | `maxLifetimeTime` | 0 (long TCP) vs 30 min recycle | **0** unless firewall requires otherwise |
 | OD-12 | `keepaliveTime` | 15s / 20s / 30s | **20000 ms** |
+| OD-13 | Bulk vs NP timeouts | Separate Hikari families vs shared pool + overlay | **Separate BULK pools (max 3) — §5.6** |
 | OD-02 | Include Primary in RR | Yes / replicas-only | **Yes — all 3** |
 | OD-03 | Connection model | Borrow/return vs leased slots | **Borrow/return** |
 | OD-04 | Metrics backend | Micrometer / JMX / legacy | **JMX + Micrometer if available** |
@@ -948,6 +968,7 @@ NpDbClient.shutdown()
 | 0.5 | 2026-07-13 | **Confirmed** last-pool-down fail-fast + CRITICAL alarm/SLP broadcast (OD-10 / FR-12) |
 | 0.6 | 2026-07-13 | §6.5: minimize loss in worker-detect → management-process lag via atomic routing quarantine |
 | 0.7 | 2026-07-13 | FR-11 boot with all DB down; production Hikari/JDBC review for long TCP, fast loss detect, &lt;20 ms |
+| 0.8 | 2026-07-13 | §5.6: different timeouts for bulk add/modify/delete vs NP via separate Hikari pool families |
 
 ---
 
@@ -962,6 +983,7 @@ Confirm before implementation:
 5. Multus static IP–only JDBC URLs  
 7. Client init with all Postgres pods down + Hikari background reconnect — **CONFIRMED** (FR-11 / §5.2)  
 8. Production property set in §5.4 (esp. `maxLifetimeTime=0`, `connectionTimeout=50ms`, `tcpNoDelay`, ms query deadline) — review/approve  
+9. Bulk DML timeouts: **separate BULK Hikari pools** (§5.6 / OD-13) — confirm  
 
 ---
 
