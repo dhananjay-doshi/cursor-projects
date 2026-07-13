@@ -382,9 +382,26 @@ Attached note (“single query marks up/down”) is **accepted for DOWN**, **rej
 
 ## 10. Performance (5k qps / &lt;20 ms)
 
-- 5,000 qps / 16 workers ≈ 312 qps/worker → average service time must stay near **~3 ms**; &lt;20 ms is p99/headroom budget.
+### 10.1 Confirmed Latency SLO
+
+**Query response time must be &lt; 20 ms** (end-to-end NP lookup through the DB connector under normal load).
+
+Indicative budget for a single successful attempt (no failover):
+
+| Segment | Budget |
+| --- | --- |
+| Pool select + `getConnection()` | ≤ 2–3 ms |
+| Postgres execute + Multus RTT | ≤ 12–15 ms |
+| Result mapping + return to pool | ≤ 2 ms |
+| **Total** | **&lt; 20 ms** |
+
+If intra-request failover occurs, each failed attempt must fail fast (short `connectionTimeout` / statement timeout) so the successful alternate attempt can still finish within the overall budget where possible; measure p99 with and without failover in soak tests.
+
+### 10.2 Capacity Sketch
+
+- 5,000 qps / 16 workers ≈ 312 qps/worker → average service time must stay near **~3 ms**; &lt;20 ms is the hard ceiling / p99 budget.
 - Warm `minimumIdle=17` avoids cold acquire.
-- **Critical:** NP `connectionTimeout` and statement/socket timeouts must be **≪ 20 ms failover budget**, not 1–2 s.
+- **Critical:** NP `connectionTimeout` and statement/socket timeouts must be **≪ 20 ms**, not the stakeholder 1–2 s values.
 - Index subscriber number; keep Multus RTT low.
 - Avoid synchronized logging on query path.
 
