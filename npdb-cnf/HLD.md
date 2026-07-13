@@ -7,7 +7,7 @@
 | Target runtime | Java (CNF / Kubernetes) |
 | Connection pool | HikariCP |
 | Database | PostgreSQL (1 Primary + 2 Replica), Multus static IPs |
-| Status | **Draft v0.6 — atomic quarantine closes worker→management event lag window (§6.5)** |
+| Status | **Draft v0.7 — boot-with-DB-down confirmed; production Hikari/JDBC property review** |
 | Audience | Architecture, Development, SRE / Ops |
 | Related | [`DESIGN_REVIEW.md`](./DESIGN_REVIEW.md) |
 
@@ -82,6 +82,8 @@ Design a production-ready, telco-grade Java connection-management module that le
 | FR-08b | Service OAM may use up to 2 alternate-pool attempts |
 | FR-09 | Metrics: queries/pool/connection, failed/available, transitions |
 | FR-10 | Postgres restart: equal LB on survivors; no NP message loss if ≥1 other pool healthy |
+| FR-11 | Client process **initializes and keeps running** if all Postgres pods are down; Hikari retries connections in background (`initializationFailTimeout=0`) | **CONFIRMED** |
+| FR-12 | When **zero** pools are UP: fail fast (no borrow); CRITICAL alarm; SLP broadcast; monitor-driven recovery only | **CONFIRMED** |
 | FR-13 | On infra failure: **quarantine routing eligibility atomically before/without waiting for Management**; event queue used for alarms/SLP only |
 
 ### 2.2 Non-Functional
@@ -203,54 +205,147 @@ PoolReplica2 → jdbc:postgresql://<MULTUS_IP_3>:5432/m7np_db?...
 
 No DNS/Service hostname for the JDBC host when Multus static IP is required.
 
-### 5.2 Bootstrap
+### 5.2 Bootstrap When All Postgres Pods Are Down (**Required**)
 
-1. Load config (IPs, secrets, pool/timeouts, SQL).
-2. Create three `HikariDataSource` with `initializationFailTimeout = 0` (process stays up if DB down).
-3. Warm pools when reachable; publish initial status.
-4. Start Monitoring, Management, Workers.
-5. Hikari continues background connection establishment for DOWN pools.
+**Application requirement:** the client process must **initialize and keep running** even if **all** Postgres server pods are down. HikariCP must **retry connection establishment in the background**.
+
+| Setting / behavior | Value | Effect |
+| --- | --- | --- |
+| `initializationFailTimeout` | **0** | Pool creation does **not** fail the process if DB is unreachable; startup continues |
+| `minimumIdle` = `maximumPoolSize` | **17** | Housekeeper keeps trying to fill the pool in the background when servers return |
+| Worker / RR policy | Only UP pools | No query-path blocking on empty/DOWN pools while DB is out |
+| Monitoring thread | Every 5 s | Probes each pool; drives RECOVERING → UP when background connects succeed |
+| Initial pool FSM | DOWN or UNKNOWN → not RR-eligible | Process up; NP returns `NPDB_ALL_POOLS_UNAVAILABLE` until ≥1 pool UP |
+
+Bootstrap sequence:
+
+1. Load config (Multus IPs, secrets, pool/timeouts, SQL).
+2. Create three `HikariDataSource` instances with `initializationFailTimeout = 0`.
+3. Do **not** abort if warm-up `getConnection()` fails; mark pools DOWN/UNKNOWN.
+4. Start Monitoring, Management, Workers — process is **in service** for non-DB concerns; NP queries fail fast until DB available.
+5. Hikari **background** connection attempts refill toward `minimumIdle`; monitor confirms health and Management sets eligibility UP.
+
+```
+All PG pods down at start
+  → Hikari pools created (no throw)
+  → eligibility mask = 0
+  → workers: nextUpPool() == null → NPDB_ALL_POOLS_UNAVAILABLE
+  → Hikari housekeeper retries TCP/auth in background
+  → first successful connections + gated probes → markEligible → RR resumes
+```
 
 ### 5.3 Pool Sizing (Stakeholder-Aligned)
 
 | Parameter | Per-pool | Rationale |
 | --- | --- | --- |
 | `maximumPoolSize` | **17** | 16 workers can all fail over onto one surviving pool + 1 monitor |
-| `minimumIdle` | **17** | Fully warm; no idle/max gap |
+| `minimumIdle` | **17** | Fully warm; keeps long-lived connections; drives background refill after outage |
 | Client total max | **51** | 17 × 3 (correct the attached doc’s “48” if max=17) |
 
 **DBA check required** against Postgres `max_connections` (and other clients).
 
 Service OAM may use smaller pools (e.g., min=max=3) per stakeholder note.
 
-### 5.4 Recommended Hikari / JDBC Settings (NP Path)
+### 5.4 Production HikariCP + JDBC Property Review (NP)
 
-| Property | Stakeholder | HLD NP recommendation | Notes |
+Goals for this review:
+
+1. **Long-lived TCP connections** — avoid Hikari churn (frequent close/reopen)  
+2. **Connection loss detection as soon as practical**  
+3. **Minimum query response** (&lt; 20 ms SLO)  
+4. **Boot / run with all DBs down** + background reconnect  
+
+#### 5.4.1 HikariCP properties
+
+| Property | Stakeholder | **Production NP recommendation** | Review |
 | --- | --- | --- | --- |
-| `maximumPoolSize` / `minimumIdle` | 17 / 17 | **17 / 17** | Adopt |
-| `keepaliveTime` | 30000 ms | **30000 ms** | App monitor every 5 s |
-| `maxLifetimeTime` | 1800000 ms | **1800000 ms** | Recycle quietly |
-| `initializationFailTimeout` | 0 | **0** | CNF boot resilience |
-| `validationTimeout` | 250 ms | **250 ms** | &lt; connectionTimeout |
-| `connectionTimeout` | 1000 ms | **≤ 20–50 ms (NP)** | Fail fast → failover; 1000 ms breaks &lt;20 ms SLO |
-| `registerMbeans` | true | **true** | Ops visibility |
-| Statement query timeout | 2 s | **≤ 15–20 ms (NP)** | Align to latency SLO |
-| JDBC `socketTimeout` | 1 s | **Align to NP query budget** | Else workers block during restart |
-| JDBC `tcpKeepAlive` | true | **true** | Multus path hygiene |
+| `maximumPoolSize` | 17 | **17** | Adopt — supports full worker failover to one pod |
+| `minimumIdle` | 17 | **17** | Adopt — equal to max ⇒ no idle eviction; background refill after outage |
+| `idleTimeout` | N/A (min=max) | **0** (or leave unused) | Surplus idle close never applies when min=max; set **0** explicitly |
+| `maxLifetimeTime` | 1800000 (30 min) | **0** (infinite) | Stakeholder 30 min **forces periodic reconnect** — conflicts with “long TCP”. Prefer **0**. If a firewall/NAT idle limit exists on Multus path, set to **slightly below** that limit (e.g. 25–50 min), not aggressively low |
+| `keepaliveTime` | 30000 | **15000–30000** (default **20000**) | Idle connection validation so dead sockets are replaced **without** killing healthy long-lived conns. 15–20 s balances faster loss detection vs probe load; app monitor is already 5 s at pool level |
+| `initializationFailTimeout` | 0 | **0** | **Required** — process starts with all PG pods down |
+| `connectionTimeout` | 1000 | **50** ms (tune 20–50) | Stakeholder **1000 ms violates &lt;20 ms** if a worker ever waits on acquire. With UP-only RR this is mostly a safety net; keep **fail-fast** |
+| `validationTimeout` | 250 | **200** ms | Bound validation during keepalive/`isValid`; must stay &lt; typical acquire budget when validation runs |
+| `connectionTestQuery` | (default isValid) | **omit** (use JDBC4 `isValid`) | Prefer driver `isValid`; avoid extra SQL unless required by old drivers |
+| `autoCommit` | — | **true** | NP lookups are read, single-statement |
+| `readOnly` | — | **true** on replica pools; primary **false** or true if primary is read-only for NP | Safety + planner hints |
+| `poolName` | — | `npdb-primary` / `npdb-r1` / `npdb-r2` | Metrics / JMX clarity |
+| `registerMbeans` | true | **true** | Production troubleshooting |
+| `leakDetectionThreshold` | — | **0** in steady prod (or 60000 in lab) | &gt;0 adds overhead; enable temporarily to catch borrow leaks |
+| `allowPoolSuspension` | — | **false** | Not needed for NP |
 
-OAM path may keep looser timeouts than NP.
+#### 5.4.2 PostgreSQL JDBC URL / driver properties
+
+**Units matter:** pgJDBC `connectTimeout` and `socketTimeout` are in **seconds**. JDBC `Statement.setQueryTimeout` is also **seconds**. Sub-20 ms control cannot use those APIs alone.
+
+| Property | Stakeholder | **Production NP recommendation** | Review |
+| --- | --- | --- | --- |
+| Host | Multus static IP | **Multus static IP only** | Mandatory |
+| `tcpKeepAlive` | true | **true** | OS-level dead peer detection on long-lived TCP — **required** |
+| `tcpNoDelay` | — | **true** | **Add** — disable Nagle; lowers latency for small NP queries |
+| `connectTimeout` | 1 (sec) | **1** (sec) | OK for **background** connect attempts; not on warm UP-path acquire |
+| `socketTimeout` | 1 (sec) | **2** (sec) as **hard safety net** | 1 s is too coarse for &lt;20 ms but prevents multi-minute TCP blackhole hangs. Do **not** set to 0. Primary fail-fast = app deadline + cancel (below), not `socketTimeout` |
+| `loginTimeout` | — | **2** (sec) | **Add** — bound auth handshake during background reconnect |
+| `cancelSignalTimeout` | — | **1** (sec) | **Add** — so query cancel cannot hang |
+| `ApplicationName` | — | `npdb-cnf` (or process name) | **Add** — Postgres `pg_stat_activity` clarity |
+| `prepareThreshold` | 3 | **1** | Faster server-side prepared statements on hot NP path |
+| `preparedStatementCacheQueries` | 20 | **20–32** | Adopt / slight headroom |
+| `preparedStatementCacheSizeMiB` | 5 | **5** | Adopt |
+| `reWriteBatchedInserts` | — | leave default | NP is lookup, not batch write |
+| SSL | (env specific) | per security policy (`sslmode`) | Do not disable if platform requires TLS |
+
+Example JDBC URL:
+
+```text
+jdbc:postgresql://<MULTUS_IP>:5432/m7np_db
+  ?tcpKeepAlive=true
+  &tcpNoDelay=true
+  &connectTimeout=1
+  &socketTimeout=2
+  &loginTimeout=2
+  &cancelSignalTimeout=1
+  &ApplicationName=npdb-cnf
+  &prepareThreshold=1
+  &preparedStatementCacheQueries=32
+  &preparedStatementCacheSizeMiB=5
+```
+
+#### 5.4.3 Application-level timeouts (required for &lt;20 ms)
+
+Because JDBC `socketTimeout` / `setQueryTimeout` are **second-granularity**, the NP connector must enforce a **millisecond** budget:
+
+| Control | Recommendation | Role |
+| --- | --- | --- |
+| Hikari `connectionTimeout` | **50 ms** | Fail acquire fast → quarantine/failover |
+| Per-query deadline + `Statement.cancel()` | **15–20 ms** watchdog | Enforce &lt;20 ms; triggers failover path on hang |
+| Optional `Connection.setNetworkTimeout(executor, ms)` | Use cautiously (e.g. **100–200 ms** ceiling) | JDBC ms API; marks connection closed on expiry — keep **above** normal query time so healthy slow-ish queries are not killed; tighter than `socketTimeout` seconds |
+
+**Do not** use stakeholder **2 s** statement timeout on the NP path.
+
+#### 5.4.4 Mapping goals → settings
+
+| Goal | How settings achieve it |
+| --- | --- |
+| Long TCP, little churn | `minIdle=maxPool=17`, `idleTimeout=0`, `maxLifetimeTime=0`, return connections to pool after each query (borrow/return does **not** close TCP) |
+| Fast loss detection | `tcpKeepAlive=true`, Hikari `keepaliveTime≈20s`, app monitor **5 s**, worker infra errors → **atomic quarantine**, ms query deadline/cancel |
+| Minimum query response | Warm pool, `tcpNoDelay`, `prepareThreshold=1`, PS cache, short `connectionTimeout`, no DOWN-pool acquires, Multus static IP |
+| Run while all DB down | `initializationFailTimeout=0`, UP-only RR, background housekeeper refill |
+
+#### 5.4.5 Platform / OS complements (ops)
+
+| Item | Guidance |
+| --- | --- |
+| Linux TCP keepalive sysctls | Optionally tune `tcp_keepalive_time/intvl/probes` on client pod for faster dead-peer detection than OS defaults (often 2 hours) — coordinate with platform |
+| Firewall idle timeout | If present, either exempt Multus NP flows or set Hikari `maxLifetimeTime` just below that value |
+| Postgres `max_connections` | ≥ 51 × app replicas (+ admin/monitor headroom) |
+| CNPG / PG `idle_session_timeout` | Must be **0/disabled** or higher than app expectations so server does not close long-lived pooled conns |
 
 ### 5.5 PreparedStatement Strategy
 
-Adopt stakeholder approach (no app-owned PS cache):
+Borrow connection → driver-cached / server-side prepared statement (`prepareThreshold=1`) → `close()` returns connection to Hikari (**TCP session kept** in pool).
 
-```
-prepareThreshold=1              # prefer 1 for NP hot path (stakeholder had 3)
-preparedStatementCacheQueries=20
-preparedStatementCacheSizeMiB=5
-```
-
-Borrow connection → use `PreparedStatement` → `close()` returns connection to Hikari. Driver recreates server-side prepared statements after connection replacement.
+No application-owned PreparedStatement cache across pool returns.
 
 ---
 
@@ -601,16 +696,27 @@ npdb:
   pool:
     maximumPoolSize: 17
     minimumIdle: 17
-    connectionTimeoutMs: 50          # NP; tune in soak
-    validationTimeoutMs: 250
-    keepaliveTimeMs: 30000
-    maxLifetimeTimeMs: 1800000
-    initializationFailTimeoutMs: 0
+    idleTimeoutMs: 0                 # long-lived; min==max
+    connectionTimeoutMs: 50          # NP fail-fast acquire
+    validationTimeoutMs: 200
+    keepaliveTimeMs: 20000           # idle dead-socket detection without churn
+    maxLifetimeTimeMs: 0              # 0 = no periodic recycle (long TCP)
+    initializationFailTimeoutMs: 0   # boot with all DB down
+    registerMbeans: true
   jdbc:
-    connectTimeoutSec: 1
-    socketTimeoutMs: 20              # align to SLO
     tcpKeepAlive: true
+    tcpNoDelay: true
+    connectTimeoutSec: 1             # background connect only
+    socketTimeoutSec: 2              # hard safety net (seconds!)
+    loginTimeoutSec: 2
+    cancelSignalTimeoutSec: 1
+    applicationName: npdb-cnf
     prepareThreshold: 1
+    preparedStatementCacheQueries: 32
+    preparedStatementCacheSizeMiB: 5
+  query:
+    deadlineMs: 20                   # app watchdog + Statement.cancel
+    networkTimeoutCeilingMs: 200     # optional Connection.setNetworkTimeout
   threads:
     workers: 16
     monitoringIntervalMs: 5000
@@ -669,6 +775,8 @@ NpDbClient.shutdown()
 | # | Topic | Options | HLD Default |
 | --- | --- | --- | --- |
 | OD-01 | Pool size | 17 per pool vs smaller | **17 / 17** (stakeholder) |
+| OD-11 | `maxLifetimeTime` | 0 (long TCP) vs 30 min recycle | **0** unless firewall requires otherwise |
+| OD-12 | `keepaliveTime` | 15s / 20s / 30s | **20000 ms** |
 | OD-02 | Include Primary in RR | Yes / replicas-only | **Yes — all 3** |
 | OD-03 | Connection model | Borrow/return vs leased slots | **Borrow/return** |
 | OD-04 | Metrics backend | Micrometer / JMX / legacy | **JMX + Micrometer if available** |
@@ -683,7 +791,7 @@ NpDbClient.shutdown()
 
 ## 16. Implementation Phases (After Confirmation)
 
-> **No code until HLD + OD-01…OD-09 confirmed.**
+> **No code until HLD + open decisions confirmed (see §15 / §19).**
 
 | Phase | Deliverable |
 | --- | --- |
@@ -720,6 +828,7 @@ NpDbClient.shutdown()
 | 0.4 | 2026-07-13 | Last remaining UP pool down: fail-fast policy (§6.4 / §20.7) |
 | 0.5 | 2026-07-13 | **Confirmed** last-pool-down fail-fast + CRITICAL alarm/SLP broadcast (OD-10 / FR-12) |
 | 0.6 | 2026-07-13 | §6.5: minimize loss in worker-detect → management-process lag via atomic routing quarantine |
+| 0.7 | 2026-07-13 | FR-11 boot with all DB down; production Hikari/JDBC review for long TCP, fast loss detect, &lt;20 ms |
 
 ---
 
@@ -732,7 +841,8 @@ Confirm before implementation:
 3. Extended states: UP / DRAINING / DOWN / RECOVERING  
 4. NP timeout alignment to confirmed **&lt; 20 ms** response-time SLO — **confirmed**  
 5. Multus static IP–only JDBC URLs  
-6. Last-pool-down fail-fast + CRITICAL + SLP broadcast — **confirmed (OD-10)**  
+7. Client init with all Postgres pods down + Hikari background reconnect — **CONFIRMED** (FR-11 / §5.2)  
+8. Production property set in §5.4 (esp. `maxLifetimeTime=0`, `connectionTimeout=50ms`, `tcpNoDelay`, ms query deadline) — review/approve  
 
 ---
 

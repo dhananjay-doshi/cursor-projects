@@ -259,3 +259,4 @@ Please confirm:
 | --- | --- | --- |
 | 0.1 | 2026-07-13 | Initial review of stakeholder CNF design; restart / equal-LB / no-message-failure analysis |
 | 0.2 | 2026-07-13 | OD-07 closed: query response time requirement confirmed as &lt; 20 ms |
+| 0.3 | 2026-07-13 | Property review: long-lived TCP, boot with DB down, fail-fast NP timeouts (see HLD §5.4) |
