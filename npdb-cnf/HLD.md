@@ -82,7 +82,7 @@ Design a production-ready, telco-grade Java connection-management module that le
 | FR-08b | Service OAM may use up to 2 alternate-pool attempts |
 | FR-09 | Metrics: queries/pool/connection, failed/available, transitions |
 | FR-10 | Postgres restart: equal LB on survivors; no NP message loss if ≥1 other pool healthy |
-| FR-12 | When **zero** pools are UP: fail fast (no borrow); CRITICAL alarm; SLP broadcast; monitor-driven recovery only |
+| FR-12 | When **zero** pools are UP: fail fast (no borrow); CRITICAL alarm; SLP broadcast; monitor-driven recovery only | **CONFIRMED** |
 
 ### 2.2 Non-Functional
 
@@ -304,9 +304,9 @@ loop:
 
 Business SQL errors (syntax, no row policy, etc.) fail once — no failover.
 
-### 6.4 Last Remaining UP Pool Restarts / Goes Down
+### 6.4 Last Remaining UP Pool Restarts / Goes Down (**CONFIRMED**)
 
-Worker selection rule (confirmed): **each worker picks the next pool that is already UP** (round-robin among UP only).
+Worker selection rule (**confirmed**): **each worker picks the next pool that is already UP** (round-robin among UP only).
 
 When the system has already degraded to a **single UP pool**, and that last pool also restarts or fails:
 
@@ -316,7 +316,7 @@ UP count: 3 → 2 → 1 → 0
                          └── last pool infra failure / restart
 ```
 
-#### Recommended behavior (normative)
+#### Confirmed behavior (normative)
 
 | Step | Action | Rationale |
 | --- | --- | --- |
@@ -562,7 +562,7 @@ NpDbClient.shutdown()
 | OD-06 | NP intra-request failover | Required for zero msg failure? | **Yes (max 2 alternates)** |
 | OD-07 | Latency SLO | &lt;20 ms vs &lt;200 ms | **Confirmed: &lt; 20 ms** |
 | OD-08 | Planned drain signal | Ops API / CNPG hook / reactive only | **Support API + reactive** |
-| OD-09 | UP gating | Single probe vs N probes + warm | **N probes + warm** |
+| OD-10 | Last UP pool also down | Keep in RR vs fail-fast | **Confirmed: fail-fast + CRITICAL + SLP broadcast (§6.4)** |
 
 ---
 
@@ -603,6 +603,7 @@ NpDbClient.shutdown()
 | 0.2 | 2026-07-13 | Aligned to stakeholder design; added restart equal-LB + no message failure controls; see DESIGN_REVIEW.md |
 | 0.3 | 2026-07-13 | Confirmed query response time SLO: **&lt; 20 ms** (OD-07 closed) |
 | 0.4 | 2026-07-13 | Last remaining UP pool down: fail-fast policy (§6.4 / §20.7) |
+| 0.5 | 2026-07-13 | **Confirmed** last-pool-down fail-fast + CRITICAL alarm/SLP broadcast (OD-10 / FR-12) |
 
 ---
 
@@ -610,11 +611,12 @@ NpDbClient.shutdown()
 
 Confirm before implementation:
 
-1. Borrow/return + 3× Hikari (max 17) + RR on UP pools  
-2. **OD-06** NP intra-request failover for no message failure  
+1. Borrow/return + 3× Hikari (max 17) + RR on UP pools — **worker picks next UP pool: confirmed**  
+2. **OD-06** NP intra-request failover for no message failure (when ≥1 other pool UP)  
 3. Extended states: UP / DRAINING / DOWN / RECOVERING  
-4. NP timeout alignment to confirmed **&lt; 20 ms** response-time SLO  
+4. NP timeout alignment to confirmed **&lt; 20 ms** response-time SLO — **confirmed**  
 5. Multus static IP–only JDBC URLs  
+6. Last-pool-down fail-fast + CRITICAL + SLP broadcast — **confirmed (OD-10)**  
 
 ---
 
